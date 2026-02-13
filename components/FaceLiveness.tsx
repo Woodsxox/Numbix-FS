@@ -57,7 +57,10 @@ export default function FaceLiveness({
   const DETECT_WIDTH = 640;
   const DETECT_HEIGHT = 480;
 
-  const blinkedRef = useRef(false);
+  // Detection flags: refs only (no useState) so frame loop is not affected by React batching
+  const eyeClosedRef = useRef(false);
+  const blinkConfirmedRef = useRef(false);
+  const hasSeenEyesOpenRef = useRef(false);
   const challengeIndexRef = useRef(0);
   const turnHoldFramesRef = useRef(0);
 
@@ -66,11 +69,21 @@ export default function FaceLiveness({
   const [earValue, setEarValue] = useState<number | null>(null);
   const [faceDetected, setFaceDetected] = useState(false);
 
-  const BLINK_THRESHOLD = 0.26;
+  const BLINK_CLOSE_THRESHOLD = 0.21;
+  const BLINK_OPEN_THRESHOLD = 0.27;
   const TURN_THRESHOLD = 0.15;
   const TURN_HOLD_FRAMES = 25;
   const mountedRef = useRef(true);
   const earUpdateRef = useRef(0);
+
+  /** Reset all liveness detection state. Call when starting a new scan so first and later scans behave the same. */
+  function resetLivenessState() {
+    eyeClosedRef.current = false;
+    blinkConfirmedRef.current = false;
+    hasSeenEyesOpenRef.current = false;
+    challengeIndexRef.current = 0;
+    turnHoldFramesRef.current = 0;
+  }
 
   /* -------------------------
      Setup
@@ -125,6 +138,7 @@ export default function FaceLiveness({
 
     if (!mountedRef.current) return;
 
+    resetLivenessState();
     setCurrent(CHALLENGES[0]);
     setStatus("challenge");
 
@@ -232,8 +246,16 @@ export default function FaceLiveness({
     const ear = (eyeAspectRatio(left) + eyeAspectRatio(right)) / 2;
     if (Number.isNaN(ear) || ear <= 0) return;
 
-    if (ear < BLINK_THRESHOLD && !blinkedRef.current) {
-      blinkedRef.current = true;
+    if (blinkConfirmedRef.current) return; // already passed blink step
+
+    if (ear > BLINK_OPEN_THRESHOLD) {
+      hasSeenEyesOpenRef.current = true;
+    }
+    if (ear < BLINK_CLOSE_THRESHOLD && hasSeenEyesOpenRef.current) {
+      eyeClosedRef.current = true;
+    }
+    if (eyeClosedRef.current && ear > BLINK_OPEN_THRESHOLD) {
+      blinkConfirmedRef.current = true;
       advance();
     }
   }
@@ -247,11 +269,13 @@ export default function FaceLiveness({
     if (width <= 0) return;
     const offset = (nose.x - left.x) / width;
 
-    const turnedLeft = offset < 0.45 - TURN_THRESHOLD;
-    const turnedRight = offset > 0.55 + TURN_THRESHOLD;
+    // In image coords: nose left = small offset, nose right = large offset.
+    // Front camera is mirrored, so "turn your head left" = nose moves to image right (large offset).
+    const noseTowardImageLeft = offset < 0.45 - TURN_THRESHOLD;
+    const noseTowardImageRight = offset > 0.55 + TURN_THRESHOLD;
 
     if (dir === "turn_left") {
-      if (turnedLeft) {
+      if (noseTowardImageRight) {
         turnHoldFramesRef.current += 1;
         if (turnHoldFramesRef.current >= TURN_HOLD_FRAMES) {
           turnHoldFramesRef.current = 0;
@@ -261,7 +285,7 @@ export default function FaceLiveness({
         turnHoldFramesRef.current = 0;
       }
     } else if (dir === "turn_right") {
-      if (turnedRight) {
+      if (noseTowardImageLeft) {
         turnHoldFramesRef.current += 1;
         if (turnHoldFramesRef.current >= TURN_HOLD_FRAMES) {
           turnHoldFramesRef.current = 0;
@@ -274,13 +298,21 @@ export default function FaceLiveness({
   }
 
   function advance() {
-    blinkedRef.current = false;
     turnHoldFramesRef.current = 0;
     challengeIndexRef.current += 1;
 
     if (challengeIndexRef.current >= CHALLENGES.length) {
       setStatus("passed");
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      // Hard stop: MUST fully stop before onPassed (prevents identity glitch)
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      if (videoRef.current?.srcObject) {
+        (videoRef.current.srcObject as MediaStream)
+          .getTracks()
+          .forEach((track) => track.stop());
+      }
       onPassed?.();
       return;
     }
@@ -319,6 +351,7 @@ export default function FaceLiveness({
         width={640}
         height={480}
         className="rounded-xl w-full max-w-full h-auto"
+        style={{ transform: "scaleX(-1)" }}
       />
       <canvas
         ref={canvasRef}
@@ -339,7 +372,7 @@ export default function FaceLiveness({
                   {!faceDetected
                     ? "Position your face in the frame."
                     : earValue != null
-                      ? `EAR: ${earValue} — close both eyes fully (blink when &lt; ${BLINK_THRESHOLD})`
+                      ? `EAR: ${earValue} — blink: close eyes (&lt; ${BLINK_CLOSE_THRESHOLD}) then open (&gt; ${BLINK_OPEN_THRESHOLD})`
                       : "Waiting for eye data…"}
                 </span>
               </>

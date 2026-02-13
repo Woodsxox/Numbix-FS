@@ -95,10 +95,8 @@ export default function FaceVerify() {
       if (!videoRef.current) return;
 
       const faceTensor = cropAndNormalizeFace(videoRef.current, box);
-      const rawEmbedding = await getEmbedding(faceTensor);
+      const liveEmbedding = await getEmbedding(faceTensor);
       faceTensor.dispose();
-
-      const liveEmbedding = new Float32Array(rawEmbedding);
       const similarity = cosineSimilarity(storedEmbedding, liveEmbedding);
 
       setScore(similarity);
@@ -131,7 +129,7 @@ export default function FaceVerify() {
   /* ------------------ UI ------------------ */
   return (
     <div className="space-y-2">
-      <video ref={videoRef} autoPlay muted playsInline className="rounded-xl" />
+      <video ref={videoRef} autoPlay muted playsInline className="rounded-xl" style={{ transform: "scaleX(-1)" }} />
 
       <p className="text-sm text-gray-600">
         {status === "initializing" && "Initializing…"}

@@ -144,10 +144,26 @@ Requires: `pip install tensorflowjs` (or `tensorflowjs[wizard]`).
 
 ---
 
+## TF.js compatibility: avoid Lambda and custom layers
+
+TensorFlow.js **does not support** Keras **Lambda** layers (or other custom Python ops). If you see in the browser console:
+
+- **"Unknown layer: Lambda"** or **"ValueError: Unknown layer: Lambda"**
+
+then your converted model still contains a Lambda layer. The converter does not rewrite Lambda layers. You must use a **different** FaceNet (or face-embedding) model that:
+
+- Uses only **standard** Keras layers (Conv2D, Dense, BatchNormalization, etc.), or
+- Has had the Lambda layer **replaced** with equivalent standard layers in Python before conversion.
+
+Many community FaceNet .h5 files include a Lambda (e.g. for L2 normalization). Prefer a model known to convert to TF.js without custom layers, or replace the Lambda in the source and re-export.
+
+---
+
 ## Troubleshooting
 
 | Problem | What to do |
 |--------|------------|
+| **"Unknown layer: Lambda"** (in console) | Your model uses a Lambda layer, which TF.js doesn’t support. Use a different FaceNet model that has no Lambda/custom layers, or replace the Lambda in the Keras source and re-convert. See section above. |
 | “The JSON contains neither model topology or manifest for weights” | Your `model.json` is still raw Keras. Replace it (and the .bin files) with the output of `tensorflowjs_converter` (Option 1 or 2). |
 | “Could not load FaceNet” / 404 | App couldn’t load from `/models/facenet/model.json`. Check that `public/models/facenet/model.json` exists and has `modelTopology` and `weightsManifest`, and that all paths in `weightsManifest` point to existing `.bin` files in the same folder. |
 | Model loads but embedding dimension is wrong | Inspect `model.predict()` output shape in `lib/facenet.ts` and adjust `getEmbedding` (squeeze/reshape) so the app gets a 128-D (or your chosen size) vector. |

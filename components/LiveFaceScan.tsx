@@ -146,6 +146,7 @@ export default function LiveFaceScan() {
         muted
         playsInline
         className="w-full rounded-xl bg-black"
+        style={{ transform: "scaleX(-1)" }}
       />
 
       <p className="text-sm text-gray-500">

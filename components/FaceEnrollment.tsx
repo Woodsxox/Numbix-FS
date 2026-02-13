@@ -6,7 +6,7 @@ import "@tensorflow/tfjs-backend-webgl";
 import * as faceDetection from "@tensorflow-models/face-detection";
 
 import { cropAndNormalizeFace } from "@/lib/faceCrop";
-import { loadFaceNet, getEmbedding } from "@/lib/facenet";
+import { loadFaceNet, getEmbedding, getFaceNetLoadError } from "@/lib/facenet";
 
 type Status =
   | "initializing"
@@ -34,6 +34,7 @@ export default function FaceEnrollment({
 
   const embeddingsRef = useRef<Float32Array[]>([]);
   const stableFramesRef = useRef(0);
+  const mountedRef = useRef(true);
 
   const REQUIRED_FRAMES = 90;
   const REQUIRED_SAMPLES = 5;
@@ -45,14 +46,29 @@ export default function FaceEnrollment({
   /* ------------------ Setup ------------------ */
   /** Returns true if ready to run detection, false if setup failed (e.g. FaceNet missing). */
   async function setup(): Promise<boolean> {
+    if (!videoRef.current) return false;
+
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "user" },
     });
 
-    if (!videoRef.current) return false;
+    if (!mountedRef.current) {
+      stream.getTracks().forEach((t) => t.stop());
+      return false;
+    }
 
     videoRef.current.srcObject = stream;
-    await videoRef.current.play();
+    try {
+      await videoRef.current.play();
+    } catch (err) {
+      const isAbort = (err as Error)?.name === "AbortError";
+      if (isAbort) {
+        stream.getTracks().forEach((t) => t.stop());
+        return false;
+      }
+      throw err;
+    }
+    if (!mountedRef.current) return false;
 
     await tf.setBackend("webgl");
     await tf.ready();
@@ -63,9 +79,14 @@ export default function FaceEnrollment({
     );
 
     const faceNet = await loadFaceNet();
+    if (!mountedRef.current) return false;
     if (!faceNet) {
+      const loadErr = getFaceNetLoadError();
+      const hint = loadErr?.includes("Lambda")
+        ? " Your model uses an unsupported Lambda layer. Use a TF.js–compatible model (see docs/FACENET_SETUP.md)."
+        : " Use a model with modelTopology + weightsManifest in public/models/facenet/, or set NEXT_PUBLIC_FACENET_GITHUB_URL to a working model.json URL.";
       setErrorMessage(
-        "FaceNet model could not be loaded. Add a TF.js–format model (modelTopology + weightsManifest) to public/models/facenet/. See README or ISSUES_AND_FIXES.md."
+        `FaceNet model could not be loaded.${hint}`
       );
       setStatus("error");
       return false;
@@ -104,7 +125,7 @@ export default function FaceEnrollment({
     const embedding = await getEmbedding(faceTensor);
 
     faceTensor.dispose();
-    embeddingsRef.current.push(new Float32Array(embedding));
+    embeddingsRef.current.push(embedding);
     setSamplesCaptured(embeddingsRef.current.length);
 
     console.log(
@@ -163,17 +184,26 @@ export default function FaceEnrollment({
 
   /* ------------------ Init ------------------ */
   useEffect(() => {
+    mountedRef.current = true;
     setup().then((ok) => {
-      if (ok) detect();
+      if (mountedRef.current && ok) detect();
+    }).catch((err) => {
+      if (mountedRef.current) {
+        setErrorMessage(err?.message ?? "Setup failed");
+        setStatus("error");
+      }
     });
 
-    return cleanup;
+    return () => {
+      mountedRef.current = false;
+      cleanup();
+    };
   }, []);
 
   /* ------------------ UI ------------------ */
   return (
     <div className="space-y-2">
-      <video ref={videoRef} autoPlay muted playsInline className="rounded-xl" />
+      <video ref={videoRef} autoPlay muted playsInline className="rounded-xl" style={{ transform: "scaleX(-1)" }} />
 
       <p className="text-sm text-gray-600">
         {status === "initializing" && "Initializing…"}
