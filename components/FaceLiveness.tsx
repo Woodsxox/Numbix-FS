@@ -5,6 +5,11 @@ import * as tf from "@tensorflow/tfjs";
 import "@tensorflow/tfjs-backend-webgl";
 import * as faceLandmarks from "@tensorflow-models/face-landmarks-detection";
 
+/** Mesh edges for drawing wireframe (pairs of keypoint indices). */
+const MESH_PAIRS = faceLandmarks.util.getAdjacentPairs(
+  faceLandmarks.SupportedModels.MediaPipeFaceMesh
+) as Array<[number, number]>;
+
 /* -------------------------
    Types
 --------------------------*/
@@ -50,6 +55,7 @@ export default function FaceLiveness({
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const meshCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const detectorRef =
     useRef<faceLandmarks.FaceLandmarksDetector | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -68,13 +74,21 @@ export default function FaceLiveness({
   const [current, setCurrent] = useState<Challenge>(CHALLENGES[0]);
   const [earValue, setEarValue] = useState<number | null>(null);
   const [faceDetected, setFaceDetected] = useState(false);
+  const [faceTooFar, setFaceTooFar] = useState(false);
+  const [faceOffCenter, setFaceOffCenter] = useState(false);
 
-  const BLINK_CLOSE_THRESHOLD = 0.21;
-  const BLINK_OPEN_THRESHOLD = 0.27;
+  const BLINK_CLOSE_THRESHOLD = 0.22;
+  const BLINK_OPEN_THRESHOLD = 0.26;
   const TURN_THRESHOLD = 0.15;
-  const TURN_HOLD_FRAMES = 25;
+  const TURN_HOLD_FRAMES = 12;
   const mountedRef = useRef(true);
   const earUpdateRef = useRef(0);
+  const frameCountRef = useRef(0);
+  const faceUpdateThrottleRef = useRef(0);
+  const lastKeypointsRef = useRef<Array<{ x: number; y: number }> | null>(null);
+  const faceTooFarRef = useRef(false);
+  const FACE_TOO_FAR_RATIO = 0.28;
+  const FACE_OFF_CENTER_PX = 70;
 
   /** Reset all liveness detection state. Call when starting a new scan so first and later scans behave the same. */
   function resetLivenessState() {
@@ -151,6 +165,61 @@ export default function FaceLiveness({
     detect();
   }
 
+  /** Draw face mesh (dots + lines) on overlay canvas. Coordinates match detection canvas; overlay has scaleX(-1) to match video. */
+  function drawMeshOverlay(points: Array<{ x: number; y: number }>) {
+    const canvas = meshCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    canvas.width = DETECT_WIDTH;
+    canvas.height = DETECT_HEIGHT;
+    ctx.clearRect(0, 0, DETECT_WIDTH, DETECT_HEIGHT);
+
+    // Draw mesh lines (purple)
+    ctx.strokeStyle = "rgba(168, 85, 247, 0.6)";
+    ctx.lineWidth = 1;
+    for (const [i, j] of MESH_PAIRS) {
+      const a = points[i];
+      const b = points[j];
+      if (a?.x != null && a?.y != null && b?.x != null && b?.y != null) {
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+
+    // Draw dots (cyan)
+    ctx.fillStyle = "rgba(34, 211, 238, 0.9)";
+    ctx.strokeStyle = "rgba(34, 211, 238, 0.5)";
+    ctx.lineWidth = 0.5;
+    for (const p of points) {
+      if (p?.x == null || p?.y == null) continue;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  /** Face bbox and center from keypoints (in canvas coords). */
+  function getFaceBounds(points: Array<{ x: number; y: number }>) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of points) {
+      if (typeof p.x !== "number" || typeof p.y !== "number") continue;
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+    if (minX === Infinity) return null;
+    const width = maxX - minX;
+    const height = maxY - minY;
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    return { minX, minY, maxX, maxY, width, height, centerX, centerY };
+  }
+
   /* -------------------------
      Detection Loop
   --------------------------*/
@@ -176,46 +245,85 @@ export default function FaceLiveness({
       ctx.drawImage(video, 0, 0, DETECT_WIDTH, DETECT_HEIGHT);
     }
 
-    let faces: Awaited<ReturnType<faceLandmarks.FaceLandmarksDetector["estimateFaces"]>> = [];
-    try {
-      faces = await detectorRef.current.estimateFaces(
-        canvas,
-        { flipHorizontal: false, staticImageMode: true }
-      );
-    } catch (err) {
-      console.warn("estimateFaces error:", err);
-      rafRef.current = requestAnimationFrame(detect);
-      return;
+    const active = CHALLENGES[challengeIndexRef.current];
+    const skipInference = active === "blink" && frameCountRef.current % 2 === 1 && lastKeypointsRef.current != null;
+    frameCountRef.current += 1;
+
+    let points: Array<{ x: number; y: number }> | null = null;
+
+    if (!skipInference) {
+      let faces: Awaited<ReturnType<faceLandmarks.FaceLandmarksDetector["estimateFaces"]>> = [];
+      try {
+        faces = await detectorRef.current.estimateFaces(
+          canvas,
+          { flipHorizontal: false, staticImageMode: true }
+        );
+      } catch (err) {
+        console.warn("estimateFaces error:", err);
+        rafRef.current = requestAnimationFrame(detect);
+        return;
+      }
+
+      if (!faces.length) {
+        lastKeypointsRef.current = null;
+        faceTooFarRef.current = false;
+        setEarValue(null);
+        setFaceDetected(false);
+        setFaceTooFar(false);
+        setFaceOffCenter(false);
+        const meshCanvas = meshCanvasRef.current;
+        if (meshCanvas) {
+          meshCanvas.width = DETECT_WIDTH;
+          meshCanvas.height = DETECT_HEIGHT;
+          const mesh = meshCanvas.getContext("2d");
+          if (mesh) mesh.clearRect(0, 0, DETECT_WIDTH, DETECT_HEIGHT);
+        }
+        rafRef.current = requestAnimationFrame(detect);
+        return;
+      }
+
+      const keypoints = faces[0].keypoints;
+      if (!keypoints || keypoints.length < 380) {
+        rafRef.current = requestAnimationFrame(detect);
+        return;
+      }
+      points = keypoints as Array<{ x: number; y: number }>;
+      lastKeypointsRef.current = points;
+    } else {
+      points = lastKeypointsRef.current;
     }
 
-    if (!faces.length) {
-      setEarValue(null);
-      setFaceDetected(false);
+    if (!points || points.length < 380) {
       rafRef.current = requestAnimationFrame(detect);
       return;
     }
 
     setFaceDetected(true);
-    const keypoints = faces[0].keypoints;
-    if (!keypoints || keypoints.length < 380) {
-      rafRef.current = requestAnimationFrame(detect);
-      return;
+    drawMeshOverlay(points);
+    const bounds = getFaceBounds(points);
+    if (bounds) {
+      const tooFar = bounds.width < DETECT_WIDTH * FACE_TOO_FAR_RATIO;
+      faceTooFarRef.current = tooFar;
+      const centerX = DETECT_WIDTH / 2, centerY = DETECT_HEIGHT / 2;
+      const offCenter = Math.hypot(bounds.centerX - centerX, bounds.centerY - centerY) > FACE_OFF_CENTER_PX;
+      faceUpdateThrottleRef.current += 1;
+      if (faceUpdateThrottleRef.current % 5 === 0) {
+        setFaceTooFar(tooFar);
+        setFaceOffCenter(!tooFar && offCenter);
+      }
     }
-
-    const points = keypoints as Array<{ x: number; y: number }>;
-    const active = CHALLENGES[challengeIndexRef.current];
 
     if (active === "blink") {
       try {
-        const left = LEFT_EYE.map((i) => points[i]);
-        const right = RIGHT_EYE.map((i) => points[i]);
+        const left = LEFT_EYE.map((i) => points![i]);
+        const right = RIGHT_EYE.map((i) => points![i]);
         const valid = (p: Array<{ x?: number; y?: number } | undefined>) =>
           p.every((q) => q != null && typeof q.x === "number" && typeof q.y === "number");
         if (valid(left) && valid(right)) {
           const ear = (eyeAspectRatio(left as Point[]) + eyeAspectRatio(right as Point[])) / 2;
           if (!Number.isNaN(ear) && ear > 0 && ear < 1) {
             const now = Date.now();
-            if (now - earUpdateRef.current > 80) {
+            if (now - earUpdateRef.current > 50) {
               earUpdateRef.current = now;
               setEarValue(Math.round(ear * 1000) / 1000);
             }
@@ -237,6 +345,7 @@ export default function FaceLiveness({
      Checks
   --------------------------*/
   function checkBlink(points: Point[]) {
+    if (faceTooFarRef.current) return; // require face close enough
     const left = LEFT_EYE.map((i) => points[i]);
     const right = RIGHT_EYE.map((i) => points[i]);
     const valid = (p: Point[]) =>
@@ -261,6 +370,7 @@ export default function FaceLiveness({
   }
 
   function checkTurn(points: Point[], dir: Challenge) {
+    if (faceTooFarRef.current) return; // require face close enough
     const nose = points[NOSE];
     const left = points[LEFT_CHEEK];
     const right = points[RIGHT_CHEEK];
@@ -343,16 +453,36 @@ export default function FaceLiveness({
   --------------------------*/
   return (
     <div className="space-y-2">
-      <video
-        ref={videoRef}
-        autoPlay
-        muted
-        playsInline
-        width={640}
-        height={480}
-        className="rounded-xl w-full max-w-full h-auto"
-        style={{ transform: "scaleX(-1)" }}
-      />
+      <div className="relative w-full max-w-full inline-block p-4">
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          width={640}
+          height={480}
+          className="rounded-xl w-full max-w-full h-auto"
+          style={{ transform: "scaleX(-1)" }}
+        />
+        {status === "challenge" && (
+          <canvas
+            ref={meshCanvasRef}
+            width={DETECT_WIDTH}
+            height={DETECT_HEIGHT}
+            className="absolute inset-0 w-full h-full rounded-xl pointer-events-none object-contain"
+            style={{ transform: "scaleX(-1)" }}
+            aria-hidden
+          />
+        )}
+        {status === "challenge" && (
+          <div
+            className="absolute inset-0 flex items-center justify-center pointer-events-none rounded-xl"
+            aria-hidden
+          >
+            <div className="border-2 border-white/80 rounded-full w-[55%] max-w-[260px] max-h-[85%] aspect-3/4" />
+          </div>
+        )}
+      </div>
       <canvas
         ref={canvasRef}
         width={DETECT_WIDTH}
@@ -370,15 +500,31 @@ export default function FaceLiveness({
                 Blink 👀
                 <span className="block text-gray-500 text-xs mt-1">
                   {!faceDetected
-                    ? "Position your face in the frame."
-                    : earValue != null
-                      ? `EAR: ${earValue} — blink: close eyes (&lt; ${BLINK_CLOSE_THRESHOLD}) then open (&gt; ${BLINK_OPEN_THRESHOLD})`
-                      : "Waiting for eye data…"}
+                    ? "Position your face in the frame. Improve lighting if needed."
+                    : faceTooFar
+                      ? "Move closer so your face fills the frame."
+                      : faceOffCenter
+                        ? "Center your face in the oval."
+                        : earValue != null
+                          ? `EAR: ${earValue} — blink naturally`
+                          : "Waiting for eye data…"}
                 </span>
               </>
             )}
-            {current === "turn_left" && "Turn left ⬅️"}
-            {current === "turn_right" && "Turn right ➡️"}
+            {current === "turn_left" && (
+              <>
+                Turn left ⬅️
+                {faceTooFar && <span className="block text-gray-500 text-xs mt-1">Move closer</span>}
+                {faceOffCenter && !faceTooFar && <span className="block text-gray-500 text-xs mt-1">Center your face in the oval</span>}
+              </>
+            )}
+            {current === "turn_right" && (
+              <>
+                Turn right ➡️
+                {faceTooFar && <span className="block text-gray-500 text-xs mt-1">Move closer</span>}
+                {faceOffCenter && !faceTooFar && <span className="block text-gray-500 text-xs mt-1">Center your face in the oval</span>}
+              </>
+            )}
           </>
         )}
         {status === "passed" && "Liveness passed ✅"}
